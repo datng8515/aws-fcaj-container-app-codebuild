@@ -10,8 +10,12 @@ phases:
         if ! command -v jq >/dev/null 2>&1; then
           if command -v apt-get >/dev/null 2>&1; then
             apt-get update -y && apt-get install -y jq
+          elif command -v dnf >/dev/null 2>&1; then
+            dnf install -y jq
+          elif command -v yum >/dev/null 2>&1; then
+            yum install -y jq
           else
-            echo "jq is required; use a CodeBuild Linux image with apt-get or install jq in the image." >&2
+            echo "Install jq in the CodeBuild image." >&2
             exit 1
           fi
         fi
@@ -19,51 +23,33 @@ phases:
   pre_build:
     commands:
       - |
-        AWS_REGION="${AWS_REGION:-${AWS_DEFAULT_REGION:-}}"
-        export AWS_REGION AWS_DEFAULT_REGION="$AWS_REGION"
-
-        if [ -z "${IMAGE_TAG:-}" ]; then
+        IMAGE_TAG="${IMAGE_TAG:-}"
+        if [ -z "$IMAGE_TAG" ]; then
           case "${CODEBUILD_WEBHOOK_HEAD_REF:-}" in
             refs/tags/*) IMAGE_TAG="${CODEBUILD_WEBHOOK_HEAD_REF#refs/tags/}" ;;
             *)
               case "${CODEBUILD_WEBHOOK_TRIGGER:-}" in
                 tag/*) IMAGE_TAG="${CODEBUILD_WEBHOOK_TRIGGER#tag/}" ;;
-                *)
-                  echo "This build was not triggered by a Git tag. Set IMAGE_TAG only for an intentional manual build." >&2
-                  exit 1
-                  ;;
+                *) echo "Trigger CodeBuild from a GitHub tag or set IMAGE_TAG." >&2; exit 1 ;;
               esac
               ;;
           esac
         fi
-        if ! printf '%s\n' "$IMAGE_TAG" | grep -Eq '^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$'; then
-          echo "IMAGE_TAG '$IMAGE_TAG' is not a valid Docker image tag." >&2
-          exit 1
-        fi
-        export IMAGE_TAG
 
-        AWS_ACCOUNT_NUMBER="${AWS_ACCOUNT_NUMBER:-$(aws sts get-caller-identity --query Account --output text)}" || exit $?
-        export AWS_ACCOUNT_NUMBER
+        AWS_REGION="${AWS_REGION:-${AWS_DEFAULT_REGION:-}}"
+        : "${AWS_REGION:?Set AWS_REGION in the CodeBuild project.}"
+        : "${CI_PROJECT_BE_NAME:?Set CI_PROJECT_BE_NAME in the CodeBuild project.}"
+        : "${TASK_NAME_BE:?Set TASK_NAME_BE in the CodeBuild project.}"
+        : "${CLUSTER_NAME:?Set CLUSTER_NAME in the CodeBuild project.}"
+        : "${SERVICE_NAME_BE:?Set SERVICE_NAME_BE in the CodeBuild project.}"
 
-        require_value() {
-          if [ -z "$2" ]; then
-            echo "Required environment variable $1 is not set." >&2
-            exit 1
-          fi
-        }
-        require_value AWS_REGION "$AWS_REGION"
-        require_value CI_PROJECT_BE_NAME "${CI_PROJECT_BE_NAME:-}"
-        require_value TASK_NAME_BE "${TASK_NAME_BE:-}"
-        require_value CLUSTER_NAME "${CLUSTER_NAME:-}"
-        require_value SERVICE_NAME_BE "${SERVICE_NAME_BE:-}"
+        AWS_ACCOUNT_NUMBER="${AWS_ACCOUNT_NUMBER:-$(aws sts get-caller-identity --query Account --output text)}" || exit 1
+        ECR_REGISTRY="${AWS_ACCOUNT_NUMBER}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+        IMAGE_NAME_BE="${ECR_REGISTRY}/${CI_PROJECT_BE_NAME}:${IMAGE_TAG}"
+        export AWS_REGION AWS_DEFAULT_REGION="$AWS_REGION" IMAGE_NAME_BE
 
-        IMAGE_NAME_BE="${AWS_ACCOUNT_NUMBER}.dkr.ecr.${AWS_REGION}.amazonaws.com/${CI_PROJECT_BE_NAME}:${IMAGE_TAG}"
-        export IMAGE_NAME_BE
-
-        echo "Logging in to ECR in ${AWS_REGION}..."
-        ECR_PASSWORD=$(aws ecr get-login-password --region "$AWS_REGION") || exit $?
-        printf '%s' "$ECR_PASSWORD" | docker login --username AWS --password-stdin \
-          "${AWS_ACCOUNT_NUMBER}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+        ECR_PASSWORD=$(aws ecr get-login-password --region "$AWS_REGION") || exit 1
+        printf '%s' "$ECR_PASSWORD" | docker login --username AWS --password-stdin "$ECR_REGISTRY" || exit 1
         unset ECR_PASSWORD
 
   build:
@@ -72,9 +58,5 @@ phases:
 
   post_build:
     commands:
-      - |
-        docker push "$IMAGE_NAME_BE"
-        bash backend/deploy-backend.sh
-
-artifacts:
-  files: []
+      - docker push "$IMAGE_NAME_BE"
+      - bash backend/deploy-backend.sh
