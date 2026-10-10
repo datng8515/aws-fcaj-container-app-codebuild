@@ -1,13 +1,13 @@
 version: 0.2
 
 env:
-  shell: bash
+  shell: /bin/sh
 
 phases:
   install:
     commands:
       - |
-        set -euo pipefail
+        set -eu
         if ! command -v jq >/dev/null 2>&1; then
           if command -v apt-get >/dev/null 2>&1; then
             apt-get update -y
@@ -21,22 +21,26 @@ phases:
   pre_build:
     commands:
       - |
-        set -euo pipefail
+        set -eu
 
         AWS_REGION="${AWS_REGION:-${AWS_DEFAULT_REGION:-}}"
         export AWS_REGION AWS_DEFAULT_REGION="$AWS_REGION"
 
-        if [[ -z "${IMAGE_TAG:-}" ]]; then
-          if [[ "${CODEBUILD_WEBHOOK_HEAD_REF:-}" == refs/tags/* ]]; then
-            IMAGE_TAG="${CODEBUILD_WEBHOOK_HEAD_REF#refs/tags/}"
-          elif [[ "${CODEBUILD_WEBHOOK_TRIGGER:-}" == tag/* ]]; then
-            IMAGE_TAG="${CODEBUILD_WEBHOOK_TRIGGER#tag/}"
-          else
-            echo "This build was not triggered by a Git tag. Set IMAGE_TAG only for an intentional manual build." >&2
-            exit 1
-          fi
+        if [ -z "${IMAGE_TAG:-}" ]; then
+          case "${CODEBUILD_WEBHOOK_HEAD_REF:-}" in
+            refs/tags/*) IMAGE_TAG="${CODEBUILD_WEBHOOK_HEAD_REF#refs/tags/}" ;;
+            *)
+              case "${CODEBUILD_WEBHOOK_TRIGGER:-}" in
+                tag/*) IMAGE_TAG="${CODEBUILD_WEBHOOK_TRIGGER#tag/}" ;;
+                *)
+                  echo "This build was not triggered by a Git tag. Set IMAGE_TAG only for an intentional manual build." >&2
+                  exit 1
+                  ;;
+              esac
+              ;;
+          esac
         fi
-        if [[ ! "$IMAGE_TAG" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$ ]]; then
+        if ! printf '%s\n' "$IMAGE_TAG" | grep -Eq '^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$'; then
           echo "IMAGE_TAG '$IMAGE_TAG' is not a valid Docker image tag." >&2
           exit 1
         fi
@@ -45,20 +49,26 @@ phases:
         AWS_ACCOUNT_NUMBER="${AWS_ACCOUNT_NUMBER:-$(aws sts get-caller-identity --query Account --output text)}"
         export AWS_ACCOUNT_NUMBER
 
-        for name in AWS_REGION CI_PROJECT_BE_NAME TASK_NAME_BE CLUSTER_NAME SERVICE_NAME_BE; do
-          if [[ -z "${!name:-}" ]]; then
-            echo "Required environment variable $name is not set." >&2
+        require_value() {
+          if [ -z "$2" ]; then
+            echo "Required environment variable $1 is not set." >&2
             exit 1
           fi
-        done
+        }
+        require_value AWS_REGION "$AWS_REGION"
+        require_value CI_PROJECT_BE_NAME "${CI_PROJECT_BE_NAME:-}"
+        require_value TASK_NAME_BE "${TASK_NAME_BE:-}"
+        require_value CLUSTER_NAME "${CLUSTER_NAME:-}"
+        require_value SERVICE_NAME_BE "${SERVICE_NAME_BE:-}"
 
         IMAGE_NAME_BE="${AWS_ACCOUNT_NUMBER}.dkr.ecr.${AWS_REGION}.amazonaws.com/${CI_PROJECT_BE_NAME}:${IMAGE_TAG}"
         export IMAGE_NAME_BE
 
         echo "Logging in to ECR in ${AWS_REGION}..."
-        aws ecr get-login-password --region "$AWS_REGION" \
-          | docker login --username AWS --password-stdin \
-              "${AWS_ACCOUNT_NUMBER}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+        ECR_PASSWORD=$(aws ecr get-login-password --region "$AWS_REGION")
+        printf '%s' "$ECR_PASSWORD" | docker login --username AWS --password-stdin \
+          "${AWS_ACCOUNT_NUMBER}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+        unset ECR_PASSWORD
 
   build:
     commands:
@@ -67,7 +77,7 @@ phases:
   post_build:
     commands:
       - |
-        set -euo pipefail
+        set -eu
         docker push "$IMAGE_NAME_BE"
         bash backend/deploy-backend.sh
 
