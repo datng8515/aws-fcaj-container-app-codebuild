@@ -69,7 +69,8 @@ phases:
 
   post_build:
     commands:
-      - echo "Pushing frontend image: $IMAGE_NAME_FE"
+      - |
+        echo "Pushing frontend image: $IMAGE_NAME_FE"
       - docker push "$IMAGE_NAME_FE"
       - echo "Deploying frontend to ECS..."
       - |
